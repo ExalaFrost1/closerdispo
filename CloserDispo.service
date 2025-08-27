@@ -1,0 +1,16 @@
+[Unit]
+Description=closerdispo Python Service
+After=network.target
+
+[Service]
+User=vicimanager
+Group=vicimanager
+WorkingDirectory=/home/vicimanager/CloserDispo
+ExecStart=/usr/bin/python3 /home/vicimanager/CloserDispo/main.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/closer.log
+StandardError=append:/var/log/closer_error.log
+
+[Install]
+WantedBy=multi-user.target

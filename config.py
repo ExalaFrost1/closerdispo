@@ -1,5 +1,6 @@
 """
 Configuration module for the Vicidial data processor
+Updated with Pub/Sub integration settings
 """
 import os
 from datetime import timedelta
@@ -34,12 +35,23 @@ MAX_CLIENT_PROCESSES = 6  # Increased for handling hundreds of CIDs
 # BigQuery settings
 SERVICE_ACCOUNT_PATH = os.environ.get(
     'GOOGLE_APPLICATION_CREDENTIALS',
-    '/home/vicimanager/CloserDispo/XFERCloserDataKey.json'
+    #'/home/vicimanager/CloserDispo/XFERCloserDataKey.json'
+    'D:\\VisualCodes\\CloserDispoTest\\XFERCloserDataKey.json'
 )
 PROJECT_ID = 'inflection-403908'
 DATASET_ID = 'confinality_vicidial'
 CREDENTIALS_TABLE = 'CloserData'
 OUTPUT_TABLE = 'XferCloserDisposition'
+
+# Pub/Sub settings
+PUBSUB_PROJECT_ID = PROJECT_ID  # Use same project as BigQuery
+VICIDIAL_CLOSER_TOPIC = 'vicidial-closer-subscription'  # Topic for closer disposition data
+PUBSUB_TIMEOUT = 30.0  # Timeout for Pub/Sub operations
+PUBSUB_MAX_MESSAGES = 1000  # Maximum messages per batch
+
+# Pub/Sub retry settings
+PUBSUB_RETRY_ATTEMPTS = 3
+PUBSUB_RETRY_WAIT = 2  # seconds
 
 # HTTP settings - OPTIMIZED
 CONCURRENT_REQUESTS = 20   # Increased from 10
@@ -57,3 +69,6 @@ CLEANUP_FREQUENCY = 100  # Clean up temp files every N batches
 
 # Add rate limiting
 REQUEST_DELAY = 0.2
+
+# LeadID batch size for optimized processing
+LeadID_BATCH_SIZE = 200  # Larger batches for better throughput with Pub/Sub

@@ -11,11 +11,20 @@ numpy>=1.24.0
 google-cloud-bigquery>=3.11.0
 pandas-gbq>=0.19.0  # This will eliminate the warning and improve performance
 
+# Google Cloud Pub/Sub - NEW FOR MESSAGING
+google-cloud-pubsub>=2.18.0
+
 # Timezone handling
 pytz>=2023.3
 
 # CSV handling optimization
 chardet>=5.2.0
+
+# JSON handling (for Pub/Sub message serialization)
+orjson>=3.9.0  # Faster JSON serialization/deserialization
+
+# Retry library for robust Pub/Sub operations
+tenacity>=8.2.0
 
 # Performance monitoring and profiling (optional)
 psutil>=5.9.0  # For memory monitoring

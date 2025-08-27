@@ -1,5 +1,6 @@
 """
 Campaign processing module - processes all clients within a single campaign
+Updated to use Pub/Sub for database operations
 """
 import asyncio
 from typing import List, Any
@@ -12,8 +13,8 @@ from utils import (
 )
 from database import (
     get_bigquery_client, check_existing_hash,
-    update_record, save_to_bigquery_batch,
-    batch_check_existing_hashes_today  # ADD THIS LINE
+    update_record_pubsub, save_to_pubsub_batch,
+    batch_check_existing_hashes_today, get_pubsub_publisher
 )
 from data_fetcher import (
     download_csv_tempfile, process_csv_chunks,
@@ -25,8 +26,8 @@ from config import (
 )
 
 
-async def process_client_credentials(session, client, credentials, shutdown_event):
-    """Process leads for a single client's credentials"""
+async def process_client_credentials(session, client, credentials, shutdown_event, pubsub_publisher=None):
+    """Process leads for a single client's credentials - WITH PUB/SUB SUPPORT"""
     campaign = credentials.Campaign
     csv_url = credentials.URL
     username = credentials.Username
@@ -65,9 +66,10 @@ async def process_client_credentials(session, client, credentials, shutdown_even
 
             processed_count = 0
             if lead_data and not shutdown_event.is_set():
-                processed_count = await process_leads(
+                processed_count = await process_leads_with_pubsub(
                     session, client, campaign, lead_details_url_template,
-                    username, password, client_name, client_id, lead_data, shutdown_event
+                    username, password, client_name, client_id, lead_data,
+                    shutdown_event, pubsub_publisher
                 )
 
             return processed_count
@@ -83,9 +85,10 @@ async def process_client_credentials(session, client, credentials, shutdown_even
         return 0
 
 
-async def process_leads(session, client, campaign, lead_details_url_template,
-                        username, password, client_name, client_id, lead_data, shutdown_event):
-    """Process leads with their datetimes in concurrent batches - WITH EFFICIENT DEDUPLICATION"""
+async def process_leads_with_pubsub(session, client, campaign, lead_details_url_template,
+                                   username, password, client_name, client_id, lead_data,
+                                   shutdown_event, pubsub_publisher=None):
+    """Process leads with their datetimes in concurrent batches - WITH PUB/SUB INTEGRATION"""
     if not lead_data or shutdown_event.is_set():
         logger.info(f"No valid leads to process for ClientID {client_id}")
         return 0
@@ -93,6 +96,15 @@ async def process_leads(session, client, campaign, lead_details_url_template,
     processed_count = 0
     total_leads = len(lead_data)
     db_batch = []
+
+    # Use provided publisher or create a new one
+    if pubsub_publisher is None:
+        async with get_pubsub_publisher() as publisher:
+            return await process_leads_with_pubsub(
+                session, client, campaign, lead_details_url_template,
+                username, password, client_name, client_id, lead_data,
+                shutdown_event, publisher
+            )
 
     logger.info(f"Starting to process {total_leads} leads for ClientID {client_id}")
 
@@ -135,8 +147,6 @@ async def process_leads(session, client, campaign, lead_details_url_template,
         logger.info(f"Generated {len(all_records)} records with hashes. Starting deduplication check...")
 
         # EFFICIENT BATCH DEDUPLICATION: Check all hashes at once
-        from database import batch_check_existing_hashes_today
-
         all_hash_values = [record['HashValue'] for record in all_records]
         existing_hashes = await batch_check_existing_hashes_today(client, all_hash_values, shutdown_event)
 
@@ -164,12 +174,12 @@ async def process_leads(session, client, campaign, lead_details_url_template,
                 else:
                     # Update if we now have length
                     if record['Length'] is not None:
-                        await update_record(client, hash_value, record, shutdown_event)
+                        await update_record_pubsub(pubsub_publisher, hash_value, record, shutdown_event)
                         updated_count += 1
                         processed_count += 1
-                        logger.debug(f"Updated existing record for lead {record['Lead']} with length")
+                        logger.debug(f"Sent update message for existing record: lead {record['Lead']}")
             else:
-                # New record - add to batch for insertion
+                # New record - add to batch for publishing
                 db_batch.append({
                     'CallTime': record['CallTime'],
                     'Campaign': campaign,
@@ -184,36 +194,36 @@ async def process_leads(session, client, campaign, lead_details_url_template,
                 })
                 new_count += 1
 
-                # Save to DB when batch size reached
+                # Publish to Pub/Sub when batch size reached
                 if len(db_batch) >= DB_BATCH_SIZE:
-                    if await save_to_bigquery_batch(client, db_batch, shutdown_event):
+                    if await save_to_pubsub_batch(pubsub_publisher, db_batch, shutdown_event):
                         processed_count += len(db_batch)
-                        logger.info(f"Saved {len(db_batch)} new records to DB")
+                        logger.info(f"Published {len(db_batch)} new records to Pub/Sub")
                     db_batch = []
 
-        # Save any remaining records
+        # Publish any remaining records
         if db_batch and not shutdown_event.is_set():
-            if await save_to_bigquery_batch(client, db_batch, shutdown_event):
+            if await save_to_pubsub_batch(pubsub_publisher, db_batch, shutdown_event):
                 processed_count += len(db_batch)
-                logger.info(f"Saved final batch of {len(db_batch)} new records to DB")
+                logger.info(f"Published final batch of {len(db_batch)} new records to Pub/Sub")
 
         # Log summary
         logger.info(f"ClientID {client_id} processing summary:")
         logger.info(f"  - Total leads processed: {len(all_records)}")
-        logger.info(f"  - New records added: {new_count}")
+        logger.info(f"  - New records published: {new_count}")
         logger.info(f"  - Existing records updated: {updated_count}")
         logger.info(f"  - Records skipped (already complete): {skipped_count}")
-        logger.info(f"  - Total database operations: {processed_count}")
+        logger.info(f"  - Total Pub/Sub operations: {processed_count}")
 
     except Exception as e:
-        logger.error(f"Error in process_leads for client {client_id}: {e}")
+        logger.error(f"Error in process_leads_with_pubsub for client {client_id}: {e}")
 
     logger.info(f"Completed processing for ClientID {client_id}. Total processed: {processed_count}")
     return processed_count
 
 
 async def process_campaign(campaign: str, credentials_list: List[Any], shutdown_event):
-    """Process all clients in a single campaign"""
+    """Process all clients in a single campaign - WITH SHARED PUB/SUB PUBLISHER"""
     logger.info(f"Starting campaign processing: {campaign} with {len(credentials_list)} clients")
 
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
@@ -224,28 +234,40 @@ async def process_campaign(campaign: str, credentials_list: List[Any], shutdown_
     try:
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             async with get_bigquery_client() as bq_client:
+                # Create a single Pub/Sub publisher for the entire campaign
+                async with get_pubsub_publisher() as pubsub_publisher:
 
-                # Process clients sequentially within the campaign
-                # (but campaigns run in parallel via multiprocessing)
-                for credentials in credentials_list:
-                    if shutdown_event.is_set():
-                        break
+                    # Process clients sequentially within the campaign
+                    # (but campaigns run in parallel via multiprocessing)
+                    for credentials in credentials_list:
+                        if shutdown_event.is_set():
+                            break
 
-                    try:
-                        processed_count = await process_client_credentials(
-                            session, bq_client, credentials, shutdown_event
-                        )
-                        total_processed += processed_count
+                        try:
+                            processed_count = await process_client_credentials(
+                                session, bq_client, credentials, shutdown_event, pubsub_publisher
+                            )
+                            total_processed += processed_count
 
-                        # Small delay between clients to prevent overwhelming
-                        await asyncio.sleep(1)
+                            # Small delay between clients to prevent overwhelming
+                            await asyncio.sleep(1)
 
-                    except Exception as e:
-                        logger.error(f"Error processing client {credentials.ClientID} in campaign {campaign}: {e}")
-                        continue
+                        except Exception as e:
+                            logger.error(f"Error processing client {credentials.ClientID} in campaign {campaign}: {e}")
+                            continue
 
     except Exception as e:
         logger.error(f"Error in campaign {campaign}: {e}")
 
     logger.info(f"Campaign {campaign} completed. Total processed: {total_processed}")
     return total_processed
+
+
+# Legacy function for backward compatibility
+async def process_leads(session, client, campaign, lead_details_url_template,
+                        username, password, client_name, client_id, lead_data, shutdown_event):
+    """Legacy wrapper function - now uses Pub/Sub"""
+    return await process_leads_with_pubsub(
+        session, client, campaign, lead_details_url_template,
+        username, password, client_name, client_id, lead_data, shutdown_event
+    )

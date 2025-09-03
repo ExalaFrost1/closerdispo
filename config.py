@@ -72,3 +72,10 @@ REQUEST_DELAY = 0.2
 
 # LeadID batch size for optimized processing
 LeadID_BATCH_SIZE = 200  # Larger batches for better throughput with Pub/Sub
+
+# Status filtering - Skip temporary statuses that will change
+SKIP_TEMPORARY_STATUSES = True  # Enable skipping of INCALL/DISPO statuses
+TEMPORARY_STATUSES = ['INCALL', 'DISPO']  # Statuses to skip - will be retried in next cycle
+
+# Add logging for status filtering
+LOG_SKIPPED_STATUSES = True  # Log when leads are skipped due to temporary status

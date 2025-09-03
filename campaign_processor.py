@@ -1,9 +1,9 @@
 """
 Campaign processing module - processes all clients within a single campaign
-Updated to use Pub/Sub for database operations
+Updated to use Pub/Sub for database operations AND optimized with hash-first approach
 """
 import asyncio
-from typing import List, Any
+from typing import List, Any, Tuple, Dict
 import aiohttp
 from urllib.parse import urlparse
 
@@ -22,12 +22,13 @@ from data_fetcher import (
 )
 from config import (
     CONCURRENT_REQUESTS, DB_BATCH_SIZE,
-    HTTP_TIMEOUT, CONNECT_TIMEOUT
+    HTTP_TIMEOUT, CONNECT_TIMEOUT,
+    SKIP_TEMPORARY_STATUSES, TEMPORARY_STATUSES, LOG_SKIPPED_STATUSES
 )
 
 
 async def process_client_credentials(session, client, credentials, shutdown_event, pubsub_publisher=None):
-    """Process leads for a single client's credentials - WITH PUB/SUB SUPPORT"""
+    """Process leads for a single client's credentials - OPTIMIZED WITH EARLY HASH CHECK"""
     campaign = credentials.Campaign
     csv_url = credentials.URL
     username = credentials.Username
@@ -62,13 +63,23 @@ async def process_client_credentials(session, client, credentials, shutdown_even
             if not csv_path or shutdown_event.is_set():
                 return 0
 
+            # STEP 1: Process CSV to get lead data (lead_id + call_time)
             lead_data = await process_csv_chunks(csv_path, shutdown_event)
 
+            if not lead_data or shutdown_event.is_set():
+                return 0
+
+            # STEP 2: EARLY HASH GENERATION AND CHECKING (BEFORE WEB SCRAPING)
+            leads_to_process = await filter_leads_by_hash_check(
+                client, lead_data, campaign, client_id, shutdown_event
+            )
+
             processed_count = 0
-            if lead_data and not shutdown_event.is_set():
-                processed_count = await process_leads_with_pubsub(
+            if leads_to_process and not shutdown_event.is_set():
+                # STEP 3: Only web scrape the leads that need processing
+                processed_count = await process_filtered_leads_with_pubsub(
                     session, client, campaign, lead_details_url_template,
-                    username, password, client_name, client_id, lead_data,
+                    username, password, client_name, client_id, leads_to_process,
                     shutdown_event, pubsub_publisher
                 )
 
@@ -85,121 +96,212 @@ async def process_client_credentials(session, client, credentials, shutdown_even
         return 0
 
 
-async def process_leads_with_pubsub(session, client, campaign, lead_details_url_template,
-                                   username, password, client_name, client_id, lead_data,
-                                   shutdown_event, pubsub_publisher=None):
-    """Process leads with their datetimes in concurrent batches - WITH PUB/SUB INTEGRATION"""
-    if not lead_data or shutdown_event.is_set():
-        logger.info(f"No valid leads to process for ClientID {client_id}")
-        return 0
+async def filter_leads_by_hash_check(client, lead_data: List[Tuple[str, str]],
+                                   campaign: str, client_id: str, shutdown_event) -> Dict[str, List]:
+    """
+    Filter leads based on hash existence check - BEFORE web scraping
+    Returns categorized leads: new, update_needed, skip
+    """
+    logger.info(f"Pre-filtering {len(lead_data)} leads using hash check for ClientID {client_id}")
 
-    processed_count = 0
-    total_leads = len(lead_data)
-    db_batch = []
+    try:
+        # STEP 1: Generate hashes for all leads (we have all needed data!)
+        lead_hash_mapping = {}
+        all_hash_values = []
+
+        for lead_id, call_datetime in lead_data:
+            if shutdown_event.is_set():
+                break
+
+            # Generate hash using available data (no web scraping needed!)
+            hash_value = generate_hash(lead_id, call_datetime, client_id, campaign)
+            lead_hash_mapping[hash_value] = {
+                'lead_id': lead_id,
+                'call_datetime': call_datetime,
+                'hash_value': hash_value
+            }
+            all_hash_values.append(hash_value)
+
+        if shutdown_event.is_set():
+            return {'new_leads': [], 'update_leads': [], 'skip_leads': []}
+
+        logger.info(f"Generated {len(all_hash_values)} hashes, checking existence in database...")
+
+        # STEP 2: Batch check all hashes against database
+        existing_hashes = await batch_check_existing_hashes_today(client, all_hash_values, shutdown_event)
+
+        # STEP 3: Categorize leads based on existence
+        new_leads = []          # Need full web scraping + insert
+        update_leads = []       # Need web scraping + update (existing but incomplete)
+        skip_leads = []         # Skip entirely (complete records exist)
+
+        for hash_value, lead_info in lead_hash_mapping.items():
+            if shutdown_event.is_set():
+                break
+
+            existing_record = existing_hashes.get(hash_value)
+
+            if existing_record:
+                # Record exists in database
+                if existing_record.get('Length') is not None:
+                    # Complete record exists - skip entirely
+                    skip_leads.append(lead_info)
+                else:
+                    # Incomplete record exists - needs update
+                    update_leads.append({
+                        **lead_info,
+                        'existing_record': existing_record
+                    })
+            else:
+                # New record - needs full processing
+                new_leads.append(lead_info)
+
+        # Log the filtering results
+        logger.info(f"Hash-based filtering results for ClientID {client_id}:")
+        logger.info(f"  - New leads (need full processing): {len(new_leads)}")
+        logger.info(f"  - Update leads (need web scraping): {len(update_leads)}")
+        logger.info(f"  - Skip leads (already complete): {len(skip_leads)}")
+
+        web_scraping_needed = len(new_leads) + len(update_leads)
+        total_leads = len(lead_data)
+        percentage_saved = ((total_leads - web_scraping_needed) / total_leads * 100) if total_leads > 0 else 0
+
+        logger.info(f"  - Web scraping efficiency: {web_scraping_needed}/{total_leads} "
+                   f"({percentage_saved:.1f}% reduction in web requests)")
+
+        return {
+            'new_leads': new_leads,
+            'update_leads': update_leads,
+            'skip_leads': skip_leads
+        }
+
+    except Exception as e:
+        logger.error(f"Error in hash-based lead filtering: {e}")
+        # Fallback: process all leads if filtering fails
+        return {
+            'new_leads': [{'lead_id': lid, 'call_datetime': ct, 'hash_value': generate_hash(lid, ct, client_id, campaign)}
+                         for lid, ct in lead_data],
+            'update_leads': [],
+            'skip_leads': []
+        }
+
+
+async def process_filtered_leads_with_pubsub(session, client, campaign, lead_details_url_template,
+                                           username, password, client_name, client_id,
+                                           leads_to_process, shutdown_event, pubsub_publisher=None):
+    """Process only the leads that need web scraping - MAXIMUM EFFICIENCY"""
+
+    new_leads = leads_to_process['new_leads']
+    update_leads = leads_to_process['update_leads']
+    skip_count = len(leads_to_process['skip_leads'])
+
+    total_to_scrape = len(new_leads) + len(update_leads)
+
+    if total_to_scrape == 0:
+        logger.info(f"No web scraping needed for ClientID {client_id} - all {skip_count} records already complete")
+        return skip_count
 
     # Use provided publisher or create a new one
     if pubsub_publisher is None:
         async with get_pubsub_publisher() as publisher:
-            return await process_leads_with_pubsub(
+            return await process_filtered_leads_with_pubsub(
                 session, client, campaign, lead_details_url_template,
-                username, password, client_name, client_id, lead_data,
+                username, password, client_name, client_id, leads_to_process,
                 shutdown_event, publisher
             )
 
-    logger.info(f"Starting to process {total_leads} leads for ClientID {client_id}")
+    logger.info(f"Web scraping {total_to_scrape} leads for ClientID {client_id} "
+               f"({len(new_leads)} new + {len(update_leads)} updates)")
+
+    processed_count = skip_count  # Count skipped records as "processed"
+    db_batch = []
 
     try:
-        # Process leads in concurrent batches
-        all_records = []  # Collect all records first
+        # Combine leads that need web scraping
+        all_leads_to_scrape = []
 
-        for i in range(0, len(lead_data), CONCURRENT_REQUESTS):
+        # Add new leads
+        for lead_info in new_leads:
+            all_leads_to_scrape.append({
+                'lead_id': lead_info['lead_id'],
+                'call_datetime': lead_info['call_datetime'],
+                'hash_value': lead_info['hash_value'],
+                'action': 'insert'
+            })
+
+        # Add update leads
+        for lead_info in update_leads:
+            all_leads_to_scrape.append({
+                'lead_id': lead_info['lead_id'],
+                'call_datetime': lead_info['call_datetime'],
+                'hash_value': lead_info['hash_value'],
+                'action': 'update',
+                'existing_record': lead_info['existing_record']
+            })
+
+        # Process leads in concurrent batches
+        for i in range(0, len(all_leads_to_scrape), CONCURRENT_REQUESTS):
             if shutdown_event.is_set():
                 break
 
-            batch_data = lead_data[i:i + CONCURRENT_REQUESTS]
+            batch_leads = all_leads_to_scrape[i:i + CONCURRENT_REQUESTS]
 
-            # Process this batch concurrently
-            logger.info(f"Processing batch {i // CONCURRENT_REQUESTS + 1} with {len(batch_data)} leads")
+            logger.info(f"Web scraping batch {i // CONCURRENT_REQUESTS + 1} with {len(batch_leads)} leads")
+
+            # Convert to format expected by process_lead_batch
+            batch_data = [(lead['lead_id'], lead['call_datetime']) for lead in batch_leads]
+
+            # Process this batch concurrently (web scraping)
             records = await process_lead_batch(
                 session, lead_details_url_template, username, password,
                 batch_data, campaign, client_id, shutdown_event
             )
 
-            # Generate hashes for all records in this batch
-            for record in records:
+            # Process each scraped record
+            for j, record in enumerate(records):
                 if shutdown_event.is_set():
                     break
 
-                try:
-                    # Generate hash for this record
-                    hash_value = generate_hash(
-                        record['Lead'], record['CallTime'], client_id, campaign
-                    )
-                    record['HashValue'] = hash_value
-                    all_records.append(record)
-                except Exception as e:
-                    logger.error(f"Error generating hash for lead {record.get('Lead', 'unknown')}: {e}")
+                if j >= len(batch_leads):
                     continue
 
-        if shutdown_event.is_set() or not all_records:
-            return processed_count
+                lead_info = batch_leads[j]
+                record['HashValue'] = lead_info['hash_value']
 
-        logger.info(f"Generated {len(all_records)} records with hashes. Starting deduplication check...")
-
-        # EFFICIENT BATCH DEDUPLICATION: Check all hashes at once
-        all_hash_values = [record['HashValue'] for record in all_records]
-        existing_hashes = await batch_check_existing_hashes_today(client, all_hash_values, shutdown_event)
-
-        logger.info(f"Deduplication check complete: {len(existing_hashes)} records already exist in today's database")
-
-        # Process each record based on existence check
-        new_count = 0
-        updated_count = 0
-        skipped_count = 0
-
-        for record in all_records:
-            if shutdown_event.is_set():
-                break
-
-            hash_value = record['HashValue']
-            existing_record = existing_hashes.get(hash_value)
-
-            if existing_record:
-                # Record with this hash already exists in TODAY'S database
-                if existing_record['Length'] is not None:
-                    # Skip if length already exists
-                    skipped_count += 1
-                    logger.debug(f"Skipping lead {record['Lead']} - already exists in today's database with length")
+                # FILTER OUT TEMPORARY STATUSES - Skip INCALL and DISPO
+                status = record.get('Status', '').upper().strip()
+                if SKIP_TEMPORARY_STATUSES and status in [s.upper() for s in TEMPORARY_STATUSES]:
+                    if LOG_SKIPPED_STATUSES:
+                        logger.info(f"Skipping lead {record['Lead']} with temporary status: {status} - will retry in next cycle")
                     continue
-                else:
-                    # Update if we now have length
-                    if record['Length'] is not None:
-                        await update_record_pubsub(pubsub_publisher, hash_value, record, shutdown_event)
-                        updated_count += 1
-                        processed_count += 1
-                        logger.debug(f"Sent update message for existing record: lead {record['Lead']}")
-            else:
-                # New record - add to batch for publishing
-                db_batch.append({
-                    'CallTime': record['CallTime'],
-                    'Campaign': campaign,
-                    'ClientName': client_name,
-                    'ClientID': client_id,
-                    'LeadID': record['Lead'],
-                    'Phone': record['Phone'],
-                    'Status': record['Status'],
-                    'Ingroup': record['Ingroup'],
-                    'Length': record['Length'],
-                    'HashValue': record['HashValue']
-                })
-                new_count += 1
 
-                # Publish to Pub/Sub when batch size reached
-                if len(db_batch) >= DB_BATCH_SIZE:
-                    if await save_to_pubsub_batch(pubsub_publisher, db_batch, shutdown_event):
-                        processed_count += len(db_batch)
-                        logger.info(f"Published {len(db_batch)} new records to Pub/Sub")
-                    db_batch = []
+                if lead_info['action'] == 'update':
+                    # Send update message
+                    await update_record_pubsub(pubsub_publisher, record['HashValue'], record, shutdown_event)
+                    processed_count += 1
+                    logger.debug(f"Sent update message for lead {record['Lead']}")
+
+                elif lead_info['action'] == 'insert':
+                    # Add to batch for new records
+                    db_batch.append({
+                        'CallTime': record['CallTime'],
+                        'Campaign': campaign,
+                        'ClientName': client_name,
+                        'ClientID': client_id,
+                        'LeadID': record['Lead'],
+                        'Phone': record['Phone'],
+                        'Status': record['Status'],
+                        'Ingroup': record['Ingroup'],
+                        'Length': record['Length'],
+                        'HashValue': record['HashValue']
+                    })
+
+                    # Publish to Pub/Sub when batch size reached
+                    if len(db_batch) >= DB_BATCH_SIZE:
+                        if await save_to_pubsub_batch(pubsub_publisher, db_batch, shutdown_event):
+                            processed_count += len(db_batch)
+                            logger.info(f"Published {len(db_batch)} new records to Pub/Sub")
+                        db_batch = []
 
         # Publish any remaining records
         if db_batch and not shutdown_event.is_set():
@@ -207,24 +309,23 @@ async def process_leads_with_pubsub(session, client, campaign, lead_details_url_
                 processed_count += len(db_batch)
                 logger.info(f"Published final batch of {len(db_batch)} new records to Pub/Sub")
 
-        # Log summary
+        # Log final summary
         logger.info(f"ClientID {client_id} processing summary:")
-        logger.info(f"  - Total leads processed: {len(all_records)}")
-        logger.info(f"  - New records published: {new_count}")
-        logger.info(f"  - Existing records updated: {updated_count}")
-        logger.info(f"  - Records skipped (already complete): {skipped_count}")
-        logger.info(f"  - Total Pub/Sub operations: {processed_count}")
+        logger.info(f"  - Records skipped (already complete): {skip_count}")
+        logger.info(f"  - Records web scraped: {total_to_scrape}")
+        logger.info(f"  - New records published: {len(new_leads)}")
+        logger.info(f"  - Existing records updated: {len(update_leads)}")
+        logger.info(f"  - Total processed: {processed_count}")
 
     except Exception as e:
-        logger.error(f"Error in process_leads_with_pubsub for client {client_id}: {e}")
+        logger.error(f"Error in process_filtered_leads_with_pubsub for client {client_id}: {e}")
 
-    logger.info(f"Completed processing for ClientID {client_id}. Total processed: {processed_count}")
     return processed_count
 
 
 async def process_campaign(campaign: str, credentials_list: List[Any], shutdown_event):
-    """Process all clients in a single campaign - WITH SHARED PUB/SUB PUBLISHER"""
-    logger.info(f"Starting campaign processing: {campaign} with {len(credentials_list)} clients")
+    """Process all clients in a single campaign - WITH OPTIMIZED HASH-FIRST APPROACH"""
+    logger.info(f"Starting OPTIMIZED campaign processing: {campaign} with {len(credentials_list)} clients")
 
     timeout = aiohttp.ClientTimeout(total=HTTP_TIMEOUT)
     connector = aiohttp.TCPConnector(limit=CONCURRENT_REQUESTS, limit_per_host=5)
@@ -257,16 +358,38 @@ async def process_campaign(campaign: str, credentials_list: List[Any], shutdown_
                             continue
 
     except Exception as e:
-        logger.error(f"Error in campaign {campaign}: {e}")
+        logger.error(f"Error in optimized campaign {campaign}: {e}")
 
-    logger.info(f"Campaign {campaign} completed. Total processed: {total_processed}")
+    logger.info(f"Optimized campaign {campaign} completed. Total processed: {total_processed}")
     return total_processed
 
 
 # Legacy function for backward compatibility
+async def process_leads_with_pubsub(session, client, campaign, lead_details_url_template,
+                                   username, password, client_name, client_id, lead_data,
+                                   shutdown_event, pubsub_publisher=None):
+    """Legacy wrapper - converts old flow to new optimized flow"""
+    logger.warning("Using legacy process_leads_with_pubsub - consider updating to optimized flow")
+
+    # Convert lead_data to the format expected by the new functions
+    leads_to_process = {
+        'new_leads': [{'lead_id': lid, 'call_datetime': ct, 'hash_value': generate_hash(lid, ct, client_id, campaign)}
+                     for lid, ct in lead_data],
+        'update_leads': [],
+        'skip_leads': []
+    }
+
+    return await process_filtered_leads_with_pubsub(
+        session, client, campaign, lead_details_url_template,
+        username, password, client_name, client_id, leads_to_process,
+        shutdown_event, pubsub_publisher
+    )
+
+
+# Legacy function for even older compatibility
 async def process_leads(session, client, campaign, lead_details_url_template,
                         username, password, client_name, client_id, lead_data, shutdown_event):
-    """Legacy wrapper function - now uses Pub/Sub"""
+    """Legacy wrapper function - now uses optimized Pub/Sub flow with temporary status filtering"""
     return await process_leads_with_pubsub(
         session, client, campaign, lead_details_url_template,
         username, password, client_name, client_id, lead_data, shutdown_event
